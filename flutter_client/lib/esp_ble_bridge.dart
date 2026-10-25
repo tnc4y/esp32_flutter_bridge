@@ -16,17 +16,43 @@ class EspBleBridge {
 
   final _jsonStreamController =
       StreamController<Map<String, dynamic>>.broadcast();
+  final _logStreamController = StreamController<String>.broadcast();
+  final _infoStreamController =
+      StreamController<Map<String, dynamic>>.broadcast();
   String _incomingBuffer = "";
 
   /// Broadcast stream of parsed incoming JSON payloads.
   Stream<Map<String, dynamic>> get onJsonReceived =>
       _jsonStreamController.stream;
 
+  /// Dedicated broadcast stream of real-time ESP32 log messages (`{"ev":"log","msg":"..."}`).
+  Stream<String> get onLogReceived => _logStreamController.stream;
+
+  /// Broadcast stream for device diagnostic updates (`{"ev":"info", ...}`).
+  Stream<Map<String, dynamic>> get onInfoReceived =>
+      _infoStreamController.stream;
+
   /// Whether a peripheral is currently connected and ready.
   bool get isConnected => _connectedDevice != null && _rxChar != null;
 
   /// Reference to the currently connected device.
   BluetoothDevice? get connectedDevice => _connectedDevice;
+
+  /// Helper to scan for nearby ESP32 devices advertising the bridge service UUID.
+  static Future<List<ScanResult>> scanForDevices({
+    Duration timeout = const Duration(seconds: 4),
+  }) async {
+    final List<ScanResult> results = [];
+    try {
+      await FlutterBluePlus.startScan(
+        withServices: [Guid(serviceUuid)],
+        timeout: timeout,
+      );
+      await FlutterBluePlus.isScanning.where((v) => !v).first;
+      results.addAll(FlutterBluePlus.lastScanResults);
+    } catch (_) {}
+    return results;
+  }
 
   /// Connect to an ESP32 BLE device and discover the bridge service & characteristics.
   Future<void> connect(
@@ -100,6 +126,14 @@ class EspBleBridge {
           final decoded = jsonDecode(line);
           if (decoded is Map<String, dynamic>) {
             _jsonStreamController.add(decoded);
+
+            // Route special events to dedicated sub-streams
+            final event = decoded["ev"];
+            if (event == "log" && decoded["msg"] != null) {
+              _logStreamController.add(decoded["msg"].toString());
+            } else if (event == "info") {
+              _infoStreamController.add(decoded);
+            }
           }
         } catch (_) {
           // Discard malformed packets
@@ -142,8 +176,29 @@ class EspBleBridge {
   Future<void> scanWifi() => sendJson(const {"cmd": "scan"});
 
   /// Tells the ESP32 to connect to a Wi-Fi network and save credentials to NVS.
-  Future<void> connectWifi(String ssid, String pass) =>
-      sendJson({"cmd": "wifi", "s": ssid, "p": pass});
+  /// Optionally sends custom provisioning parameters (e.g., MQTT broker, API token)
+  /// stored in [extraConfig].
+  Future<void> connectWifi(
+    String ssid,
+    String pass, {
+    Map<String, dynamic>? extraConfig,
+  }) {
+    final Map<String, dynamic> payload = {
+      "cmd": "wifi",
+      "s": ssid,
+      "p": pass,
+    };
+    if (extraConfig != null && extraConfig.isNotEmpty) {
+      payload["extra"] = extraConfig;
+    }
+    return sendJson(payload);
+  }
+
+  /// Requests device diagnostics (Wi-Fi status, IP, RSSI, Free Heap, Uptime).
+  Future<void> requestInfo() => sendJson(const {"cmd": "info"});
+
+  /// Erases saved Wi-Fi credentials and extra config from NVS, and disconnects Wi-Fi.
+  Future<void> resetWifi() => sendJson(const {"cmd": "reset_wifi"});
 
   /// Pings the ESP32.
   Future<void> ping() => sendJson(const {"cmd": "ping"});
@@ -152,5 +207,7 @@ class EspBleBridge {
   void dispose() {
     _txSubscription?.cancel();
     _jsonStreamController.close();
+    _logStreamController.close();
+    _infoStreamController.close();
   }
 }

@@ -5,13 +5,22 @@ import 'esp_ble_bridge.dart';
 
 /// Opens the ready-to-use ESP32 Wi-Fi Provisioning modal bottom sheet.
 ///
-/// If [device] is passed and [bridge] is not yet connected, it connects automatically.
+/// Features:
+/// - **Auto-Discovery:** If [bridge] is not yet connected, automatically scans for
+///   nearby ESP32 devices advertising the bridge service.
+/// - **Zero-Touch Connect:** If exactly one ESP32 is found, automatically connects
+///   and transitions directly into Wi-Fi network scanning!
+/// - **Extra Config (Custom Payload):** Passes optional [extraConfig] (e.g. MQTT broker,
+///   auth tokens, device IDs) to the ESP32 to be stored in NVS.
+///
 /// Returns the ESP32 IP address (String?) upon successful connection, or null if dismissed.
 Future<String?> showEspProvisioningSheet(
   BuildContext context,
   EspBleBridge bridge, {
   BluetoothDevice? device,
+  Map<String, dynamic>? extraConfig,
   String title = "ESP32 Wi-Fi Kurulumu",
+  bool autoConnectSingleDevice = true,
 }) {
   return showModalBottomSheet<String>(
     context: context,
@@ -24,7 +33,9 @@ Future<String?> showEspProvisioningSheet(
     builder: (ctx) => _EspProvisioningSheetContent(
       bridge: bridge,
       device: device,
+      extraConfig: extraConfig,
       title: title,
+      autoConnectSingleDevice: autoConnectSingleDevice,
     ),
   );
 }
@@ -32,12 +43,16 @@ Future<String?> showEspProvisioningSheet(
 class _EspProvisioningSheetContent extends StatefulWidget {
   final EspBleBridge bridge;
   final BluetoothDevice? device;
+  final Map<String, dynamic>? extraConfig;
   final String title;
+  final bool autoConnectSingleDevice;
 
   const _EspProvisioningSheetContent({
     required this.bridge,
     this.device,
+    this.extraConfig,
     required this.title,
+    required this.autoConnectSingleDevice,
   });
 
   @override
@@ -45,15 +60,23 @@ class _EspProvisioningSheetContent extends StatefulWidget {
       _EspProvisioningSheetContentState();
 }
 
+enum _ProvisioningStep {
+  discoveringBle,
+  selectingBleDevice,
+  scanningWifi,
+  enteringPassword,
+}
+
 class _EspProvisioningSheetContentState
     extends State<_EspProvisioningSheetContent> {
   StreamSubscription<Map<String, dynamic>>? _sub;
   final TextEditingController _passController = TextEditingController();
 
+  _ProvisioningStep _step = _ProvisioningStep.scanningWifi;
+  final List<ScanResult> _discoveredBleDevices = [];
   List<Map<String, dynamic>> _networks = [];
   String? _selectedSsid;
   bool _isConnectingDevice = false;
-  bool _isScanning = true;
   bool _isConnectingWifi = false;
   bool _obscurePass = true;
   String? _statusMessage;
@@ -74,57 +97,136 @@ class _EspProvisioningSheetContentState
   }
 
   Future<void> _initFlow() async {
-    // Connect to device if specified and not yet connected
+    // If specific device was provided, connect directly
     if (widget.device != null && !widget.bridge.isConnected) {
-      setState(() {
-        _isConnectingDevice = true;
-        _statusMessage = "ESP32 cihazına bağlanılıyor...";
-      });
-
-      try {
-        await widget.bridge.connect(widget.device!);
-        if (!mounted) return;
-        setState(() {
-          _isConnectingDevice = false;
-          _statusMessage = null;
-        });
-      } catch (e) {
-        if (!mounted) return;
-        setState(() {
-          _isConnectingDevice = false;
-          _isScanning = false;
-          _hasError = true;
-          _statusMessage = "Cihaza bağlanılamadı: ${e.toString()}";
-        });
-        return;
-      }
+      await _connectToBleDevice(widget.device!);
+      return;
     }
 
-    _startScan();
+    // If already connected, jump straight to Wi-Fi scan
+    if (widget.bridge.isConnected) {
+      _startWifiScan();
+      return;
+    }
+
+    // Otherwise, start BLE Auto-Discovery
+    _startBleDiscovery();
   }
 
-  void _startScan() {
+  // --- Step 1: BLE Auto-Discovery & Zero-Touch Connect ---
+
+  Future<void> _startBleDiscovery() async {
+    setState(() {
+      _step = _ProvisioningStep.discoveringBle;
+      _discoveredBleDevices.clear();
+      _statusMessage = "Çevredeki ESP32 cihazları aranıyor...";
+      _hasError = false;
+    });
+
+    try {
+      await FlutterBluePlus.startScan(
+        withServices: [Guid(EspBleBridge.serviceUuid)],
+        timeout: const Duration(milliseconds: 2800),
+      );
+
+      final subscription = FlutterBluePlus.scanResults.listen((results) {
+        if (mounted) {
+          setState(() {
+            _discoveredBleDevices.clear();
+            _discoveredBleDevices.addAll(results);
+          });
+        }
+      });
+
+      await FlutterBluePlus.isScanning.where((val) => !val).first;
+      await subscription.cancel();
+
+      if (!mounted) return;
+
+      // Magical Zero-Touch Connect: Exactly 1 ESP32 found!
+      if (_discoveredBleDevices.length == 1 && widget.autoConnectSingleDevice) {
+        final singleDevice = _discoveredBleDevices.first.device;
+        final name = singleDevice.platformName.isNotEmpty
+            ? singleDevice.platformName
+            : "ESP32";
+        setState(() {
+          _statusMessage = "'$name' bulundu, otomatik bağlanılıyor...";
+        });
+        await _connectToBleDevice(singleDevice);
+      } else if (_discoveredBleDevices.isEmpty) {
+        setState(() {
+          _hasError = true;
+          _statusMessage = "Çevrede EspFlutterBridge çalıştıran cihaz bulunamadı.";
+        });
+      } else {
+        // Multiple devices found, show selection list
+        setState(() {
+          _step = _ProvisioningStep.selectingBleDevice;
+          _statusMessage = null;
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _hasError = true;
+          _statusMessage = "Bluetooth tarama hatası: $e";
+        });
+      }
+    }
+  }
+
+  Future<void> _connectToBleDevice(BluetoothDevice device) async {
+    setState(() {
+      _isConnectingDevice = true;
+      _statusMessage = "'${device.platformName.isNotEmpty ? device.platformName : "ESP32"}' cihazına bağlanılıyor...";
+      _hasError = false;
+    });
+
+    try {
+      await widget.bridge.connect(device);
+      if (!mounted) return;
+      setState(() {
+        _isConnectingDevice = false;
+        _statusMessage = null;
+      });
+      _startWifiScan();
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _isConnectingDevice = false;
+        _hasError = true;
+        _statusMessage = "Cihaza bağlanılamadı: $e";
+        _step = _discoveredBleDevices.length > 1
+            ? _ProvisioningStep.selectingBleDevice
+            : _ProvisioningStep.discoveringBle;
+      });
+    }
+  }
+
+  // --- Step 2: Wi-Fi Scanning & Provisioning ---
+
+  void _startWifiScan() {
     if (!widget.bridge.isConnected) {
       setState(() {
-        _isScanning = false;
         _hasError = true;
-        _statusMessage = "ESP32 BLE bağlı değil.";
+        _statusMessage = "ESP32 BLE bağlantısı yok.";
       });
       return;
     }
 
     setState(() {
-      _isScanning = true;
+      _step = _ProvisioningStep.scanningWifi;
+      _selectedSsid = null;
       _statusMessage = null;
       _hasError = false;
+      _networks.clear();
     });
 
     widget.bridge.scanWifi().catchError((err) {
       if (mounted) {
         setState(() {
-          _isScanning = false;
           _hasError = true;
-          _statusMessage = "Tarama başlatılamadı: $err";
+          _statusMessage = "Wi-Fi taraması başlatılamadı: $err";
         });
       }
     });
@@ -156,7 +258,6 @@ class _EspProvisioningSheetContentState
       if (mounted) {
         setState(() {
           _networks = sorted;
-          _isScanning = false;
         });
       }
     }
@@ -202,10 +303,14 @@ class _EspProvisioningSheetContentState
     setState(() {
       _isConnectingWifi = true;
       _hasError = false;
-      _statusMessage = "Kimlik bilgileri ESP32'ye aktarılıyor...";
+      _statusMessage = "Kimlik bilgileri ve ayarlar ESP32'ye aktarılıyor...";
     });
 
-    widget.bridge.connectWifi(_selectedSsid!, _passController.text.trim());
+    widget.bridge.connectWifi(
+      _selectedSsid!,
+      _passController.text.trim(),
+      extraConfig: widget.extraConfig,
+    );
   }
 
   IconData _getRssiIcon(int rssi) {
@@ -250,39 +355,45 @@ class _EspProvisioningSheetContentState
               Expanded(
                 child: Row(
                   children: [
-                    if (_selectedSsid != null && !_isConnectingWifi)
+                    if (_step == _ProvisioningStep.enteringPassword && !_isConnectingWifi)
                       IconButton(
                         icon: const Icon(Icons.arrow_back_ios_new, size: 18),
                         onPressed: () => setState(() {
+                          _step = _ProvisioningStep.scanningWifi;
                           _selectedSsid = null;
                           _statusMessage = null;
                           _passController.clear();
                         }),
+                      )
+                    else if (_step == _ProvisioningStep.selectingBleDevice && !_isConnectingDevice)
+                      IconButton(
+                        icon: const Icon(Icons.refresh, size: 20),
+                        tooltip: "Tekrar Ara",
+                        onPressed: _startBleDiscovery,
                       ),
                     Flexible(
                       child: Text(
                         _selectedSsid ?? widget.title,
                         overflow: TextOverflow.ellipsis,
-                        style:
-                            Theme.of(context).textTheme.titleLarge?.copyWith(
-                                  fontWeight: FontWeight.bold,
-                                ),
+                        style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                              fontWeight: FontWeight.bold,
+                            ),
                       ),
                     ),
                   ],
                 ),
               ),
-              if (_selectedSsid == null && !_isConnectingDevice)
+              if (_step == _ProvisioningStep.scanningWifi)
                 IconButton(
-                  onPressed: _isScanning ? null : _startScan,
-                  icon: _isScanning
+                  onPressed: _startWifiScan,
+                  icon: _networks.isEmpty
                       ? const SizedBox(
                           width: 20,
                           height: 20,
                           child: CircularProgressIndicator(strokeWidth: 2),
                         )
                       : const Icon(Icons.refresh),
-                  tooltip: "Yeniden Tara",
+                  tooltip: "Wi-Fi Yeniden Tara",
                 ),
             ],
           ),
@@ -324,22 +435,15 @@ class _EspProvisioningSheetContentState
               ),
             ),
 
-          // Main View: Network List or Password Form
-          if (_isConnectingDevice)
-            const Padding(
-              padding: EdgeInsets.symmetric(vertical: 48),
-              child: Column(
-                children: [
-                  CircularProgressIndicator(),
-                  SizedBox(height: 16),
-                  Text("ESP32 cihazına bağlanılıyor..."),
-                ],
-              ),
-            )
-          else if (_selectedSsid == null)
-            _buildNetworkList(colorScheme)
+          // Dynamic Body based on active step
+          if (_step == _ProvisioningStep.discoveringBle || _isConnectingDevice)
+            _buildBleDiscoveryView(colorScheme)
+          else if (_step == _ProvisioningStep.selectingBleDevice)
+            _buildBleSelectionView(colorScheme)
+          else if (_step == _ProvisioningStep.enteringPassword)
+            _buildPasswordForm(colorScheme)
           else
-            _buildPasswordForm(colorScheme),
+            _buildNetworkList(colorScheme),
 
           const SizedBox(height: 20),
         ],
@@ -347,34 +451,70 @@ class _EspProvisioningSheetContentState
     );
   }
 
+  Widget _buildBleDiscoveryView(ColorScheme colorScheme) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 40),
+      child: Column(
+        children: [
+          const CircularProgressIndicator(),
+          const SizedBox(height: 16),
+          Text(
+            _isConnectingDevice
+                ? "ESP32 BLE bağlantısı kuruluyor..."
+                : "Çevredeki ESP32 cihazları taranıyor...",
+            style: const TextStyle(fontWeight: FontWeight.w500),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildBleSelectionView(ColorScheme colorScheme) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        const Padding(
+          padding: EdgeInsets.only(bottom: 8),
+          child: Text(
+            "Birden fazla ESP32 cihazı bulundu. Lütfen bağlanmak istediğinizi seçin:",
+            style: TextStyle(fontSize: 13, color: Colors.grey),
+          ),
+        ),
+        ConstrainedBox(
+          constraints: const BoxConstraints(maxHeight: 280),
+          child: ListView.separated(
+            shrinkWrap: true,
+            itemCount: _discoveredBleDevices.length,
+            separatorBuilder: (_, __) => const Divider(height: 1),
+            itemBuilder: (context, index) {
+              final result = _discoveredBleDevices[index];
+              final name = result.device.platformName.isNotEmpty
+                  ? result.device.platformName
+                  : "ESP32 Cihazı";
+              return ListTile(
+                contentPadding: const EdgeInsets.symmetric(horizontal: 8),
+                leading: const Icon(Icons.bluetooth),
+                title: Text(name, style: const TextStyle(fontWeight: FontWeight.w500)),
+                subtitle: Text("${result.device.remoteId} (${result.rssi} dBm)"),
+                trailing: const Icon(Icons.chevron_right),
+                onTap: () => _connectToBleDevice(result.device),
+              );
+            },
+          ),
+        ),
+      ],
+    );
+  }
+
   Widget _buildNetworkList(ColorScheme colorScheme) {
-    if (_isScanning) {
+    if (_networks.isEmpty) {
       return const Padding(
-        padding: EdgeInsets.symmetric(vertical: 48),
+        padding: EdgeInsets.symmetric(vertical: 40),
         child: Column(
           children: [
             CircularProgressIndicator(),
             SizedBox(height: 16),
             Text("ESP32 çevredeki Wi-Fi ağlarını tarıyor..."),
-          ],
-        ),
-      );
-    }
-
-    if (_networks.isEmpty) {
-      return Padding(
-        padding: const EdgeInsets.symmetric(vertical: 36),
-        child: Column(
-          children: [
-            Icon(Icons.wifi_off, size: 48, color: colorScheme.outline),
-            const SizedBox(height: 12),
-            const Text("Hiçbir Wi-Fi ağı bulunamadı."),
-            const SizedBox(height: 8),
-            TextButton.icon(
-              onPressed: _startScan,
-              icon: const Icon(Icons.refresh),
-              label: const Text("Tekrar Dene"),
-            ),
           ],
         ),
       );
@@ -402,6 +542,7 @@ class _EspProvisioningSheetContentState
             trailing: const Icon(Icons.chevron_right, size: 20),
             onTap: () => setState(() {
               _selectedSsid = ssid;
+              _step = _ProvisioningStep.enteringPassword;
               _statusMessage = null;
             }),
           );
@@ -434,6 +575,17 @@ class _EspProvisioningSheetContentState
             ),
           ),
         ),
+        if (widget.extraConfig != null && widget.extraConfig!.isNotEmpty) ...[
+          const SizedBox(height: 8),
+          Text(
+            "Ek yapılandırma aktarılacak (${widget.extraConfig!.keys.join(', ')})",
+            style: TextStyle(
+              fontSize: 12,
+              color: colorScheme.primary,
+              fontWeight: FontWeight.w500,
+            ),
+          ),
+        ],
         const SizedBox(height: 16),
         FilledButton.icon(
           onPressed: _isConnectingWifi ? null : _connectToWifi,

@@ -9,6 +9,7 @@
 #include <BLE2902.h>
 #include <ArduinoJson.h>
 #include <functional>
+#include <cstdarg>
 
 #define EFB_SERVICE_UUID "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
 #define EFB_CHAR_RX_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
@@ -20,7 +21,8 @@
  */
 class EspFlutterBridge : public BLEServerCallbacks, public BLECharacteristicCallbacks {
 public:
-    using JsonCallback = std::function<void(JsonDocument&)>;
+    using JsonCallback   = std::function<void(JsonDocument&)>;
+    using ConfigCallback = std::function<void(JsonObject&)>;
 
     /**
      * @brief Initialize BLE stack, advertising, and attempt auto-connection to saved Wi-Fi.
@@ -66,10 +68,12 @@ public:
 
         pService->start();
 
-        // Start Advertising with service UUID
+        // Start Advertising with service UUID & mobile optimization flags
         BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
         pAdvertising->addServiceUUID(EFB_SERVICE_UUID);
         pAdvertising->setScanResponse(true);
+        pAdvertising->setMinPreferred(0x06); // Assists iOS connection stability
+        pAdvertising->setMinPreferred(0x12);
         BLEDevice::startAdvertising();
     }
 
@@ -98,6 +102,33 @@ public:
      */
     void onJsonReceived(JsonCallback cb) {
         _userCallback = cb;
+    }
+
+    /**
+     * @brief Register a callback triggered when custom extraConfig parameters arrive during provisioning.
+     * @param cb Callback receiving JsonObject containing extra configuration key-values.
+     */
+    void onConfigReceived(ConfigCallback cb) {
+        _configCallback = cb;
+    }
+
+    /**
+     * @brief Retrieve a string value from NVS saved during provisioning extraConfig.
+     */
+    String getConfig(const char* key, const String& defaultValue = "") {
+        _prefs.begin("efb_cfg", true);
+        String val = _prefs.getString(key, defaultValue);
+        _prefs.end();
+        return val;
+    }
+
+    /**
+     * @brief Save or update a custom string configuration in NVS.
+     */
+    void setConfig(const char* key, const String& value) {
+        _prefs.begin("efb_cfg", false);
+        _prefs.putString(key, value);
+        _prefs.end();
     }
 
     /**
@@ -136,10 +167,46 @@ public:
     }
 
     /**
+     * @brief Sends a real-time log message to Flutter's live debug console over BLE
+     *        and echoes it to hardware Serial.
+     * @param msg Log message string.
+     */
+    void log(const String& msg) {
+        Serial.println(msg);
+        if (_deviceConnected && _pTxChar) {
+            JsonDocument doc;
+            doc["ev"] = "log";
+            doc["msg"] = msg;
+            sendJson(doc);
+        }
+    }
+
+    /**
+     * @brief Formatted log output (printf-style) sent over BLE and Serial.
+     */
+    void logf(const char* format, ...) {
+        char buffer[256];
+        va_list args;
+        va_start(args, format);
+        vsnprintf(buffer, sizeof(buffer), format, args);
+        va_end(args);
+        log(String(buffer));
+    }
+
+    /**
      * @brief Clear saved Wi-Fi credentials from NVS.
      */
     void clearSavedWifi() {
         _prefs.begin("efb_wifi", false);
+        _prefs.clear();
+        _prefs.end();
+    }
+
+    /**
+     * @brief Clear saved custom configuration from NVS.
+     */
+    void clearSavedConfig() {
+        _prefs.begin("efb_cfg", false);
         _prefs.clear();
         _prefs.end();
     }
@@ -175,6 +242,7 @@ private:
     volatile bool _commandReady = false;
     bool _deviceConnected = false;
     JsonCallback _userCallback = nullptr;
+    ConfigCallback _configCallback = nullptr;
 
     void _processCommand(const String& jsonRaw) {
         JsonDocument doc;
@@ -202,10 +270,24 @@ private:
             sendJson(res);
             WiFi.scanDelete();
         }
-        // 2. Built-in Command: Wi-Fi Connect & NVS Persist
+        // 2. Built-in Command: Wi-Fi Connect, Save Credentials & Extra Config
         else if (cmd == "wifi") {
             String ssid = doc["s"] | "";
             String pass = doc["p"] | "";
+
+            // Save custom extraConfig payload if present (e.g. MQTT host, user token, device ID)
+            if (doc["extra"].is<JsonObject>()) {
+                JsonObject extra = doc["extra"].as<JsonObject>();
+                _prefs.begin("efb_cfg", false);
+                for (JsonPair kv : extra) {
+                    _prefs.putString(kv.key().c_str(), kv.value().as<String>());
+                }
+                _prefs.end();
+
+                if (_configCallback) {
+                    _configCallback(extra);
+                }
+            }
 
             WiFi.disconnect();
             WiFi.begin(ssid.c_str(), pass.c_str());
@@ -229,7 +311,26 @@ private:
                 sendRawJson("{\"ev\":\"status\",\"s\":\"failed\"}");
             }
         }
-        // 3. Custom Developer Commands (Sensors, relays, telemetry, etc.)
+        // 3. Built-in Command: Device Diagnostics (Info)
+        else if (cmd == "info") {
+            JsonDocument res;
+            res["ev"] = "info";
+            res["wifi"] = (WiFi.status() == WL_CONNECTED);
+            res["ssid"] = WiFi.SSID();
+            res["ip"] = WiFi.localIP().toString();
+            res["rssi"] = WiFi.RSSI();
+            res["heap"] = ESP.getFreeHeap();
+            res["uptime"] = millis();
+            sendJson(res);
+        }
+        // 4. Built-in Command: Factory Reset Wi-Fi & Configuration
+        else if (cmd == "reset_wifi") {
+            clearSavedWifi();
+            clearSavedConfig();
+            WiFi.disconnect(true);
+            sendRawJson("{\"ev\":\"status\",\"s\":\"reset\"}");
+        }
+        // 5. Custom Developer Commands (Sensors, relays, telemetry, etc.)
         else {
             if (_userCallback) {
                 _userCallback(doc);
