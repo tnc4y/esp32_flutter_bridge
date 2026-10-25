@@ -1,0 +1,39 @@
+# General OS files
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+ehthumbs.db
+
+# PlatformIO & C++
+.pio/
+.pioenvs/
+.piolibdeps/
+.clangd/
+compile_commands.json
+*.hex
+*.bin
+*.elf
+
+# Flutter & Dart
+.dart_tool/
+.packages
+.pub-cache/
+.pub/
+build/
+*.mode1v3
+*.mode2v3
+*.moved-aside
+*.pbxuser
+*.perspectivev3
+**/.flutter-plugins
+**/.flutter-plugins-dependencies
+
+# IDEs
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
+*.iml
+*.sublime-project
+*.sublime-workspace
